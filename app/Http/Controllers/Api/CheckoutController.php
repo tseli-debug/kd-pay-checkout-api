@@ -7,6 +7,7 @@ use App\Models\PaymentLink;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
 
 class CheckoutController extends Controller
@@ -114,6 +115,12 @@ class CheckoutController extends Controller
             ->get('https://openapi.m-pesa.com/'.$environment.'/ipg/v2/vodacomLES/getSession/');
 
         if (!$sessionResponse->successful()) {
+            Log::warning('M-Pesa session-key request rejected.', [
+                'status' => $sessionResponse->status(),
+                'environment' => $environment,
+                'response' => $sessionResponse->json(),
+            ]);
+
             return response()->json([
                 'code' => 'mpesa_session_key_failed',
                 'message' => 'M-Pesa rejected the session-key request.',
@@ -192,13 +199,27 @@ class CheckoutController extends Controller
 
     private function createMpesaBearerToken(string $apiKey, string $publicKey): ?string
     {
-        $pem = "-----BEGIN PUBLIC KEY-----\n";
-        $pem .= chunk_split(trim($publicKey), 64, "\n");
-        $pem .= "-----END PUBLIC KEY-----";
+        $pem = $this->normalizeMpesaPublicKey($publicKey);
 
         $encrypted = null;
         $success = openssl_public_encrypt($apiKey, $encrypted, $pem, OPENSSL_PKCS1_PADDING);
 
         return $success ? base64_encode($encrypted) : null;
+    }
+
+    private function normalizeMpesaPublicKey(string $publicKey): string
+    {
+        $publicKey = trim(str_replace("\r\n", "\n", $publicKey));
+
+        if (preg_match('/^-----BEGIN [^-]+-----/', $publicKey) === 1) {
+            return $publicKey;
+        }
+
+        $body = preg_replace('/^-----BEGIN [^-]+-----\n?|-----END [^-]+-----$/', '', $publicKey);
+        $body = preg_replace('/\s+/', '', (string) $body);
+
+        return "-----BEGIN PUBLIC KEY-----\n"
+            .chunk_split($body, 64, "\n")
+            ."-----END PUBLIC KEY-----";
     }
 }

@@ -6,6 +6,7 @@ use App\Models\ApiToken;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Hash;
+use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Str;
 use Tests\TestCase;
 
@@ -117,6 +118,48 @@ class PaymentApiTest extends TestCase
             'phone' => '+26658123456',
         ])->assertStatus(503)
             ->assertJsonPath('code', 'payment_provider_unavailable');
+
+        $this->assertDatabaseCount('payment_transactions', 0);
+    }
+
+    public function test_checkout_reports_when_mpesa_rejects_session_key_request(): void
+    {
+        $merchant = User::factory()->create(['business_name' => 'TechHive Store']);
+        $link = $merchant->paymentLinks()->create([
+            'public_id' => (string) Str::uuid(),
+            'title' => 'Wireless Earbuds Pro',
+            'amount' => '1299.00',
+            'currency' => 'LSL',
+            'status' => 'active',
+        ]);
+
+        $privateKey = openssl_pkey_new([
+            'private_key_bits' => 2048,
+            'private_key_type' => OPENSSL_KEYTYPE_RSA,
+        ]);
+        $details = openssl_pkey_get_details($privateKey);
+        $publicKey = $details['key'];
+
+        config()->set([
+            'kdpay.mpesa.enabled' => true,
+            'kdpay.mpesa.environment' => 'sandbox',
+            'kdpay.mpesa.api_key' => 'test-api-key',
+            'kdpay.mpesa.public_key' => $publicKey,
+            'kdpay.mpesa.service_provider_code' => '171717',
+        ]);
+
+        Http::fake([
+            'https://openapi.m-pesa.com/sandbox/ipg/v2/vodacomLES/getSession/' => Http::response([
+                'output_ResponseCode' => 'INS-2001',
+                'output_ResponseDesc' => 'Invalid token',
+            ], 401),
+        ]);
+
+        $this->postJson('/api/v1/checkout/'.$link->public_id.'/transactions', [
+            'provider' => 'mpesa',
+            'phone' => '+26658123456',
+        ])->assertStatus(502)
+            ->assertJsonPath('code', 'mpesa_session_key_failed');
 
         $this->assertDatabaseCount('payment_transactions', 0);
     }
