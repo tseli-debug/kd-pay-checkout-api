@@ -5,6 +5,7 @@ namespace Tests\Feature;
 use App\Models\ApiToken;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Http\Client\Request as HttpRequest;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Str;
@@ -161,6 +162,141 @@ class PaymentApiTest extends TestCase
         ])->assertStatus(502)
             ->assertJsonPath('code', 'mpesa_session_key_failed');
 
+        $this->assertDatabaseCount('payment_transactions', 0);
+    }
+
+    public function test_checkout_creates_a_paypal_order_for_a_usd_link(): void
+    {
+        $merchant = User::factory()->create(['business_name' => 'TechHive Store']);
+        $link = $merchant->paymentLinks()->create([
+            'public_id' => (string) Str::uuid(),
+            'title' => 'Wireless Earbuds Pro',
+            'amount' => '15.00',
+            'currency' => 'USD',
+            'status' => 'active',
+        ]);
+
+        config()->set([
+            'kdpay.paypal.enabled' => true,
+            'kdpay.paypal.mode' => 'sandbox',
+            'kdpay.paypal.client_id' => 'sandbox-client-id',
+            'kdpay.paypal.client_secret' => 'sandbox-client-secret',
+        ]);
+
+        Http::fake([
+            'https://api-m.sandbox.paypal.com/v1/oauth2/token' => Http::response([
+                'access_token' => 'paypal-access-token',
+            ]),
+            'https://api-m.sandbox.paypal.com/v2/checkout/orders' => Http::response([
+                'id' => 'PAYPAL-ORDER-123',
+                'links' => [
+                    ['rel' => 'approve', 'href' => 'https://www.sandbox.paypal.com/checkoutnow?token=PAYPAL-ORDER-123'],
+                ],
+            ], 201),
+        ]);
+
+        $this->postJson('/api/v1/checkout/'.$link->public_id.'/transactions', [
+            'provider' => 'paypal',
+        ])->assertCreated()
+            ->assertJsonPath('data.provider', 'paypal')
+            ->assertJsonPath('data.status', 'initiated')
+            ->assertJsonPath('data.approval_url', 'https://www.sandbox.paypal.com/checkoutnow?token=PAYPAL-ORDER-123')
+            ->assertJsonPath('data.currency', 'USD');
+
+        $this->assertDatabaseHas('payment_transactions', [
+            'payment_link_id' => $link->id,
+            'provider' => 'paypal',
+            'provider_reference' => 'PAYPAL-ORDER-123',
+            'amount' => '15.00',
+            'currency' => 'USD',
+            'status' => 'initiated',
+        ]);
+
+        Http::assertSent(fn (HttpRequest $request) => $request->url() === 'https://api-m.sandbox.paypal.com/v2/checkout/orders'
+            && $request->data()['purchase_units'][0]['amount'] === [
+                'currency_code' => 'USD',
+                'value' => '15.00',
+            ]);
+    }
+
+    public function test_paypal_captures_an_approved_order_and_marks_transaction_paid(): void
+    {
+        $merchant = User::factory()->create();
+        $link = $merchant->paymentLinks()->create([
+            'public_id' => (string) Str::uuid(),
+            'title' => 'Sandbox test purchase',
+            'amount' => '15.00',
+            'currency' => 'USD',
+            'status' => 'active',
+        ]);
+        $reference = 'PAYPALREFERENCE123';
+        $link->transactions()->create([
+            'merchant_id' => $merchant->id,
+            'reference' => $reference,
+            'provider' => 'paypal',
+            'provider_reference' => 'PAYPAL-ORDER-123',
+            'amount' => '15.00',
+            'currency' => 'USD',
+            'status' => 'initiated',
+            'idempotency_key' => $reference,
+        ]);
+
+        config()->set([
+            'kdpay.paypal.enabled' => true,
+            'kdpay.paypal.mode' => 'sandbox',
+            'kdpay.paypal.client_id' => 'sandbox-client-id',
+            'kdpay.paypal.client_secret' => 'sandbox-client-secret',
+        ]);
+
+        Http::fake([
+            'https://api-m.sandbox.paypal.com/v1/oauth2/token' => Http::response([
+                'access_token' => 'paypal-access-token',
+            ]),
+            'https://api-m.sandbox.paypal.com/v2/checkout/orders/PAYPAL-ORDER-123/capture' => Http::response([
+                'id' => 'PAYPAL-ORDER-123',
+                'status' => 'COMPLETED',
+                'purchase_units' => [[
+                    'payments' => [
+                        'captures' => [[
+                            'status' => 'COMPLETED',
+                            'amount' => [
+                                'currency_code' => 'USD',
+                                'value' => '15.00',
+                            ],
+                        ]],
+                    ],
+                ]],
+            ]),
+        ]);
+
+        $this->get('/api/v1/checkout/'.$link->public_id.'/paypal/return?reference='.$reference.'&token=PAYPAL-ORDER-123')
+            ->assertRedirect('http://localhost:3000/'.$link->public_id.'?payment_status=success&transaction_reference='.$reference);
+
+        $this->assertDatabaseHas('payment_transactions', [
+            'reference' => $reference,
+            'status' => 'paid',
+        ]);
+    }
+
+    public function test_paypal_rejects_an_lsl_link_without_creating_an_order(): void
+    {
+        $merchant = User::factory()->create();
+        $link = $merchant->paymentLinks()->create([
+            'public_id' => (string) Str::uuid(),
+            'title' => 'LSL link',
+            'amount' => '15.00',
+            'currency' => 'LSL',
+            'status' => 'active',
+        ]);
+        config()->set('kdpay.paypal.enabled', true);
+        Http::fake();
+
+        $this->postJson('/api/v1/checkout/'.$link->public_id.'/transactions', [
+            'provider' => 'paypal',
+        ])->assertUnprocessable()
+            ->assertJsonPath('code', 'payment_currency_not_supported');
+
+        Http::assertNothingSent();
         $this->assertDatabaseCount('payment_transactions', 0);
     }
 

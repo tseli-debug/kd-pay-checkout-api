@@ -35,7 +35,7 @@ class PaymentLinkController extends Controller
             'title' => ['required', 'string', 'max:120'],
             'description' => ['nullable', 'string', 'max:2000'],
             'amount' => ['nullable', 'decimal:0,2', 'min:0.01', 'max:9999999999.99'],
-            'currency' => ['sometimes', 'in:LSL'],
+            'currency' => ['sometimes', 'in:'.implode(',', config('kdpay.supported_currencies'))],
             'expires_at' => ['nullable', 'date', 'after:now'],
             'success_url' => ['nullable', 'url', 'max:2048'],
             'cancel_url' => ['nullable', 'url', 'max:2048'],
